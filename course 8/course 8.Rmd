@@ -24,77 +24,96 @@ test_raw = read.csv("~/Git/myWD/course 8/pml-testing.csv")
 c(dim(train_raw), dim(test_raw))
 ```
 
-160 variables represents 4 sensors with eight features on the Euler angles (roll, pitch and yaw). But if we check the NA values of training data, only 406 rows are complete, which is really small size compared to total 19,622 records. If we check NA of each variable, we found 67 is pretty empty, each has 19,216 VAs. Then we decide to only keep those variable with none NA values.  
+data source: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har. 
+
+160 variables represents 4 sensors with eight features on the Euler angles (roll, pitch and yaw). But if we check the NA values of training data, only 406 rows are complete, which is really a small size compared to total 19,622 records. If we check NA of each variable, we found 67 is pretty empty, each has 19,216 nulls. We decide to only keep those variable with none NA values.  
 
 ```{r}
-sum(complete.cases(train_raw))
+sum(complete.cases(train_raw))  # 406
 
 na_col <- apply(train_raw, 2, FUN = function(x) length(x[is.na(x)]))
 # names(na_col[na_col > 0])  ## 67 columns have 19,216 NA rows
 # names(na_col[na_col == 0])  ## 93 columns have full data
-
 train_clean <- train_raw[, names(na_col[na_col == 0])]
 ```
 
-data source: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har. 
-
-Furthermore we only keep the sensor's measurements. And then transform those "factor" columns to "numeric" ones.
+Furthermore we remove all ID-related variables (first 8 columns) and keep only those sensor's measurements. And then transform those "factor" columns to "numeric". And finally all variables with near Zero Variance were removed. At the end, we came up with a data set with 19,622 objs and 52 variables.
 
 ```{r}
-train <- train_clean[, c(seq(9,92))]    ## 84 cols
+train <- train_clean[, c(seq(8,92))]    ## 85 cols
 # sum((sapply(train, class) == 'factor'))  ## 33 cols
 factor_col <- names(train[(sapply(train, class) == 'factor') == TRUE])
 train[, factor_col] <- sapply(train[, factor_col], as.numeric)
+
+train <- train[, -nearZeroVar(train)]  # 52 columns
 ```
 
 ## Feature Selection
 
-There are many ways to selection features. We are going to use the filter method based on correlation, using 0.5 as cutoff absolute correlation. It turns out we can remove 62 redundant variables, and keep only 22.
+There are many ways to selection features. We are going to use the straight forward filter method based on correlation, using 0.5 as cutoff absolute correlation. It turns out we removed 31 redundant variables, and kept only 21.
 
 ```{r}
 set.seed(7)
-corMatrix <- cor(train)
-highlyCor <- findCorrelation(corMatrix, cutoff = .5)  ## 62 variables
+highlyCor <- findCorrelation(cor(train), cutoff = .5)  ## 31 variables
+train <- train[, -highlyCor]
 ```
 
 ## Modeling
 
-Since there are 5 classes of activity pattern, we choose random forest method to train the model. Before doing so we have to complete the data set to include the tagged class of each mesurement.
+Since there are 5 classes of activity pattern, we choose RF (bagging), GBM (boosting), and LDA (model based) methods to train our model. 
+Before doing so, we have to complete the data set by including the tagged class of each mesurement and then partitioned it into 70% training set and 30% testing set.
 
 ```{r}
-data <- cbind(train[, -highlyCor], train_clean[, 93]); 
-colnames(data)[23] <- c("classe")
+data <- cbind(train, train_clean[, 93]); 
+colnames(data)[22] <- c("classe")
 
+inTrain <- createDataPartition(data$classe, p = .7, list = FALSE)
+training <- data[inTrain, ]
+testing <- data[-inTrain, ]
 ```
 
-We use 5-fold cross-validation. On top of that, we enable parallel capacity to improve the training performance. The Accuracy (average) is 98.52%. It is pretty amazing! We also print a plot to show which predictors is more important in predicting the quality of an activity.
+We use default cross-validation settings for the training control. We also enable parallel capacity to improve the training performance. The Accuracy of RF is 98.1%, GBM 87.2%, and LDA 49.8%. It looks like RF is the best based on the training data.
 
 ```{r}
 cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
 registerDoParallel(cluster)
 
 set.seed(7)
-fitControl <- trainControl(method = 'cv', number = 5, allowParallel = TRUE)
-fit <- train(classe ~ ., data = data, method = 'rf', trControl = fitControl)
+fitControl <- trainControl(method = 'cv', allowParallel = TRUE)
+modRF <- train(classe ~ ., data = training, method = 'rf', trControl = fitControl)
+
+fitControl <- trainControl(method = 'repeatedcv', allowParallel = TRUE)
+modGBM <- train(classe ~ ., data = training, method = 'gbm', verbose = F, trControl = fitControl)
+
+modLDA <- train(classe ~ ., data = training, method = 'lda', trControl = fitControl)
 
 stopCluster(cluster)
 registerDoSEQ()
+```
 
-plot(fit)
-confusionMatrix.train(fit)
-plot(varImp(fit))
+## Model selection based on Out of Sample Error
+
+We applied 3 models to the testing data set to check the out of sample error. RF performs robust at 98.1% accuracy level, and GBM a little bit down to 86.8%. LDA is almost the same 49.9%. Then we are comfortable to chose RF as our final model. 
+Let's take a close look at the RF final model. It modeled 10-fold cross-validation and the best model is based on the mtry = 2 (randomly pick 2 varaibles at each node/split). We also print a plot to see which predictors influence the prediction of the quality of an activity.
+
+```{r}
+predRF <- confusionMatrix(predict(modRF, testing), testing$classe)
+predGBM <- confusionMatrix(predict(modGBM, testing), testing$classe)
+predLDA <- confusionMatrix(predict(modLDA, testing), testing$classe)
+c(RF = predRF$overall[1], GBM = predGBM$overall[1], LDA = predLDA$overall[1])
+
+modRF
+plot(varImp(modRF))
 ```
 
 ## Prediction and Condlusion
 
-The model looks great! Let's perform this on our test data. First of all, we have to pre-process the data in order to apply the model. It turns out that the 1st variable of test data is empty, so I imputed it with the mean of the same varable in train data set.
+Before we use the model to predict the validation data set, we have to pre-process the data in order to get the same size. 
 
 ```{r}
-test_raw = read.csv("~/Git/myWD/course 8/pml-testing.csv")
-test <- test_raw[, colnames(data[, 1:22])]
-test[, 1] = mean(data$skewness_roll_belt.1)
+test <- test_raw[, colnames(data[, 1:21])]
 
-predict(fit, test)
+predict(modRF, test)
 ```
 
-The outcome is awesome. I fed it to the QUiz and got 100% correction.Now we are comfortable to conclude that the model we created performs well, and can be used to predict the quality of weight lifts.
+The outcome (100% accuracy based on the Quiz session) proves that the model we created performs well, and can be used to predict the quality of weight lifts.
